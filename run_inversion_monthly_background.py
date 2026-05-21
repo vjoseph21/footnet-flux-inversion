@@ -521,7 +521,7 @@ else:
     mismatch = csc_matrix(mismatch)
     xp_comb = csc_matrix(xp_comb)
     
-    inv_term = inv(HBHT_comb + R)
+    inv_term = inv(HBHT_comb + Ro)
     gain1 = inv_term @ mismatch
     xdiff = HB_comb.T @ (gain1)
     xpost = xp_comb + xdiff
