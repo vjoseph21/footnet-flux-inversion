@@ -19,11 +19,19 @@ from joblib import Parallel, delayed
 from sklearn.model_selection import train_test_split
 from scipy.sparse.linalg import inv
 from pprint import pprint
+import logging
+import argparse
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 from get_TROPOMI_obs import getTROPOMI
 from emissions import getEmissions
-
-args = sys.argv[1:]
 
 class TROPOMI_config():
     def __init__(self, cfs):
@@ -36,11 +44,9 @@ class TROPOMI_config():
         self.start_time = datetime.datetime.strptime(cfs["start_time"], "%Y%m%d%H")
         self.end_time = datetime.datetime.strptime(cfs["end_time"], "%Y%m%d%H")
 
-        self.week_start_date = self.start_time - datetime.timedelta(days=self.start_time.weekday() + 1 if self.start_time.weekday() < 6 else 0) - datetime.timedelta(hours=self.start_time.hour)
-        self.inv_start_time = self.week_start_date - datetime.timedelta(days=self.ems_buffer_days)
-        
-        self.week_end_date = self.end_time - datetime.timedelta(days=self.end_time.weekday() + 1 if self.end_time.weekday() < 6 else 0) - datetime.timedelta(hours=self.end_time.hour)
-        self.inv_end_time = self.week_end_date + datetime.timedelta(days=self.ems_buffer_days) # datetime.datetime(2021, 1, 2, 23)
+        # Just add buffer without week rounding
+        self.inv_start_time = self.start_time - datetime.timedelta(days=self.ems_buffer_days)
+        self.inv_end_time = self.end_time + datetime.timedelta(days=self.ems_buffer_days)
     
         self.xres = cfs["xres"]
         self.yres = cfs["yres"]
@@ -75,19 +81,36 @@ class TROPOMI_config():
         self.output_path = cfs["output_path"]
 
 class Arguments():
-    def __init__(self):
-        self.config = str(args[0])
-        self.start_time = str(args[1])
-        self.end_time = str(args[2])
+    def __init__(self, config, start_time, end_time):
+        self.config = config
+        self.start_time = start_time
+        self.end_time = end_time
 
 def get_stored_df(path, start_time, end_time):
     obs_df = pd.read_csv(path)
-    obs_df['delta_time'] = obs_df['delta_time'].apply(lambda x:datetime.datetime.strptime(x, "%Y-%m-%d %H:%M:%S.%f"))
-    obs_df['actual_time'] = obs_df['actual_time'].apply(lambda x:datetime.datetime.strptime(x, "%Y-%m-%d %H:%M:%S.%f"))
-    obs_df['time'] = obs_df['time'].apply(lambda x:datetime.datetime.strptime(x, "%Y-%m-%d %H:%M:%S"))
+
+    # Parse datetimes - handle both with and without microseconds
+    def parse_datetime_flexible(x):
+        for fmt in ["%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"]:
+            try:
+                return datetime.datetime.strptime(x, fmt)
+            except ValueError:
+                continue
+        raise ValueError(f"Could not parse datetime: {x}")
+
+    obs_df['delta_time'] = obs_df['delta_time'].apply(parse_datetime_flexible)
+    obs_df['actual_time'] = obs_df['actual_time'].apply(parse_datetime_flexible)
+
+    # Create 'time' by rounding actual_time to nearest hour
+    obs_df['time'] = pd.to_datetime(obs_df['actual_time']).dt.round('60min')
+
     obs_df = obs_df[(obs_df["time"] >= start_time) & (obs_df["time"] <= end_time)]
     obs_df = obs_df.sort_values(["time", "lon", "lat"])
-    obs_df["bkg_ref"] = obs_df["bkg_ref"].apply(lambda x: eval(x))
+
+    # Load background reference if it exists
+    if "bkg_ref" in obs_df.columns:
+        obs_df["bkg_ref"] = obs_df["bkg_ref"].apply(lambda x: eval(x, {"datetime": datetime}) if isinstance(x, str) else x)
+
     return obs_df.reset_index(drop=True)
 
 def get_obs_dict(obs_df):
@@ -118,6 +141,10 @@ def get_bkg_prior_error():
     error_mask = np.ones((len(bkg_dict.keys()), len(xp_bkg_date_range)))
     
     for idx, val in train_obs_dict.items():
+        # Skip observations with no background reference (missing wind data)
+        if not val["bkg_ref"]:
+            continue
+
         tstamp = val["time"] - datetime.timedelta(hours=val["time"].hour)
         t_index = xp_bkg_date_range.index(tstamp)
         if t_index not in xp_bkg_dict:
@@ -129,6 +156,10 @@ def get_bkg_prior_error():
             xp_bkg_error_dict[t_index][octant_idx-1] = xp_bkg_error_dict[t_index].get(octant_idx-1, []) + [octant_bkg_error]
     
     for idx, val in train_obs_dict.items():
+        # Skip observations with no background reference
+        if not val["bkg_ref"]:
+            continue
+
         tstamp = val["time"] - datetime.timedelta(hours=val["time"].hour)
         t_index = xp_bkg_date_range.index(tstamp)
         for octant in val["bkg_ref"]:
@@ -159,12 +190,28 @@ def fill_H(config, dates, obs_dict):
     for idx, value in tqdm(obs_dict.items()):
         date = value["time"]
 
-        week_start_date = (
-            date - datetime.timedelta(days=date.weekday() + 1 if date.weekday() < 6 else 0)
-            - datetime.timedelta(hours=date.hour)
-        )
+        # Round to the Sunday of this week (just the date part)
+        week_sunday_date = date - datetime.timedelta(days=date.weekday() + 1 if date.weekday() < 6 else 0)
+        week_sunday_date = week_sunday_date.replace(hour=0, minute=0, second=0, microsecond=0)
 
-        m_index = dates.get_loc(week_start_date)
+        # Find the matching date in the dates index (which preserves the original time)
+        # dates are weekly Sundays, so find which Sunday this observation belongs to
+        matching_date = None
+        for d in dates:
+            if d.date() == week_sunday_date.date():
+                matching_date = d
+                break
+
+        if matching_date is None:
+            if idx < 3:
+                print(f"\nDEBUG: Observation mapping failed")
+                print(f"  Observation date: {date}")
+                print(f"  Rounded to Sunday (date only): {week_sunday_date}")
+                print(f"  Dates in index: {list(dates)}")
+                print(f"  Available Sundays: {[d.date() for d in dates]}")
+            raise ValueError(f"Observation at {date} rounds to {week_sunday_date.date()} which is not in weekly dates index. Available: {[d.date() for d in dates]}")
+
+        m_index = dates.get_loc(matching_date)
 
         file = (
             f"{config.footprint_path}/{date.year}/{date.month}/"
@@ -190,10 +237,9 @@ def fill_H(config, dates, obs_dict):
         dtype=np.float32
     )
 
-    return H_old * 1000 # converting from ppm to ppb
+    return H_old  # FootNet footprints already in correct units (ppb per umol/m2/s)
 
-def compute_H_background(obs_dict, config):
-    xp_bkg_date_range = list(pd.date_range(start=config.inv_start_time, end=config.inv_end_time, freq="1D"))
+def compute_H_background(obs_dict, config, xp_bkg_date_range):
     nObs = len(obs_dict)
     H_b_train = np.zeros((nObs, xp_bkg.shape[0]))
     
@@ -388,226 +434,380 @@ def get_Sa_t(Xp, tau_week, tau_year, correlation_type="mod"):
 
     return Sa_t
 
-args = Arguments()
 
-with open(args.config, "r") as f:
-    cfg = yaml.safe_load(f)
-    cfg["start_time"] = args.start_time
-    cfg["end_time"] = args.end_time
+if __name__ == "__main__":
+    try:
+        # Parse arguments
+        parser = argparse.ArgumentParser(description="Run monthly Bayesian inversion with background")
+        parser.add_argument("--config", required=True, help="Path to YAML config file")
+        parsed_args = parser.parse_args()
 
-config = TROPOMI_config(cfg)
+        logger.info("="*60)
+        logger.info("Starting Bayesian Inversion (Monthly Background)")
+        logger.info("="*60)
 
-file = f"{config.output_path}/inversion_data_{config.inv_start_time.strftime('%Y%m%d%H')}_{config.inv_end_time.strftime('%Y%m%d%H')}.nc"
-if os.path.exists(file):
-    print(f"{file} already exists. Terminating ...")
-else:
-    pprint(cfg)
-    train_df = get_stored_df(config.tropomi_train_file, config.start_time, config.inv_end_time)
-    test_df = get_stored_df(config.tropomi_test_file, config.inv_start_time, config.inv_end_time)
-    print("Train size:", train_df.shape, "Test size:", test_df.shape)
-    
-    train_obs_dict = get_obs_dict(train_df)
-    test_obs_dict = get_obs_dict(test_df)
-    
-    bkg_dict, bkg_date_range = load_background_data(config)
-    xp_bkg_date_range = list(pd.date_range(start=config.inv_start_time, end=config.inv_end_time, freq="1D"))
-    
-    dates = pd.date_range(start=config.inv_start_time, end=config.inv_end_time, freq="W")
-    
-    lons = config.lons
-    lats = config.lats
-    m = lons.shape[0]*lats.shape[0]
-    inventory_type = config.inventory_type
-    inventory_path = config.inventory_path
-    print(f"inventory type: {inventory_type} | inventory path: {inventory_path}")
-    emission = getEmissions(lons, lats, inventory_type, m, inventory_path=inventory_path, ems_scaling_factor=config.ems_scaling_factor)
-    print(dates, dates.shape)
-    xp = emission.compute_x_prior_vector(dates)
-    print("Prior flux shape:", xp.shape)
-    
-    # Background prior
-    xp_bkg, xp_bkg_error = get_bkg_prior_error() 
-    
-    # Jacobian flux
-    H_old_train = fill_H(config, dates, train_obs_dict)
-    H_old_test = fill_H(config, dates, test_obs_dict)
-    # print(H_old_train)
-    print("Jacobian flux train shape:", H_old_train.shape)
-    print("Jacobian flux test shape:", H_old_test.shape)
-    # import pdb; pdb.set_trace()
-    # Jacobian background
-    H_b_train = compute_H_background(train_obs_dict, config)
-    H_b_test = compute_H_background(test_obs_dict, config)
-    print(H_b_train)
-    print(H_b_test)
-    print("Jacobian background train shape:", H_b_train.shape)
-    print("Jacobian background test shape:", H_b_test.shape)
-    
-    # Observation error correlation matrix
-    print("Computing obs error correlation matrix (R)")
-    R = fill_R(train_obs_dict)
-    # print(R)
-    
-    # Computing D and E
-    print("Computing D and E")
-    tau_week = 52
-    tau_year = 5
-    Sa_t_mod = get_Sa_t(xp, tau_week, tau_year, correlation_type="mod")
-    Sa_xy = load_npz("data/Sa_xy.npz")
-    
-    ems_uncert = config.ems_uncert
-    D, E = compute_D_E(Sa_xy, Sa_t_mod, emission, ems_uncert)
-    
-    # Computing background prior error covariance matrix
-    print("Computing background prior error covariance matrix (B_b)")
-    def compute_bkg_prior_error_covariance(xp_bkg, xp_bkg_date_range, xp_bkg_error, tau_day_bkg=1, lower_bound=1e-5):
-        B_b = np.zeros((xp_bkg.shape[0], xp_bkg.shape[0]))
-        for i in range(B_b.shape[0]):
-            t_index_i = i // 8
-            octant_index_i = i - t_index_i*8
-            # print(t_index_i, octant_index_i, i)
-            sigmai = xp_bkg_error[octant_index_i, t_index_i]
-            B_b[i, i] = sigmai**2
-            tstampi = xp_bkg_date_range[t_index_i]
-            for j in range(i+1, B_b.shape[0]):
-                t_index_j = j // 8
-                octant_index_j = j - t_index_j*8
-                tstampj = xp_bkg_date_range[t_index_j]
-                sigmaj = xp_bkg_error[octant_index_j, t_index_j]
-                if octant_index_i == octant_index_j:
-                    time_delay = (tstampj - tstampi).days
-                    temp_time = np.exp(-time_delay/tau_day_bkg)
-                    sig_val = sigmai*sigmaj*temp_time
-                    if sig_val >= lower_bound:
-                        B_b[i, j] = sig_val
-                        B_b[j, i] = sig_val
-        return B_b
-    B_b = compute_bkg_prior_error_covariance(xp_bkg, xp_bkg_date_range, xp_bkg_error, tau_day_bkg=1, lower_bound=1e-5)
-    print(B_b)
-    
-    
-    # Inversion data prep
-    Y = np.array([val["methane_mixing_ratio_bias_corrected"] for val in train_obs_dict.values()]).reshape(-1, 1)
-    xp_comb = np.concat([xp, xp_bkg], axis=0)
-    Y = csc_matrix(Y)
-    xp_comb = csc_matrix(xp_comb)
-    
-    H_b_train_sparse = csc_matrix(H_b_train)
-    H_train_comb = sparse.hstack((H_old_train, H_b_train_sparse), format='csc')
-    
-    # Obs error correlation to covariance
-    y_sim = H_train_comb @ xp_comb
-    mismatch = Y - y_sim
-    sigma_mismatch = np.std(mismatch.toarray())
-    
-    Ro = R*(sigma_mismatch**2)
-    
-    # HB and HBHT matrices
-    print("Computing HB and HBHT matrices")
-    HB_old = HQ_sparse_parallel(H_old_train, D, E, n_jobs=4)
-    HBHT_old = HQHT_sparse(HB_old, H_old_train, D, E)
-    
-    HB_b = H_b_train @ B_b
-    HB_b = csc_matrix(HB_b)
-    
-    HBHT_b = HB_b @ H_b_train.T
-    HBHT_b = csc_matrix(HBHT_b)
-    
-    HB_comb = sparse.hstack((HB_old, HB_b), format='csc')
-    HBHT_comb = HBHT_old + HBHT_b
-    
-    # Conducting analytical inversion
-    print("Inversion")
-    mismatch = csc_matrix(mismatch)
-    xp_comb = csc_matrix(xp_comb)
-    
-    inv_term = inv(HBHT_comb + Ro)
-    gain1 = inv_term @ mismatch
-    xdiff = HB_comb.T @ (gain1)
-    xpost = xp_comb + xdiff
-    
-    xpost_fluxes = xpost[:xp.shape[0]]
-    xpost_bkg = xpost[xp.shape[0]:]
-    
-    print("Gathering fluxes")
-    xfluxes = np.zeros((dates.shape[0], config.lats.shape[0], config.lons.shape[0]))
-    xpost_fluxes = xpost_fluxes.toarray()
-    dates_list = []
-    for idx, date in enumerate(dates):
-        date = int(date.strftime("%Y%m%d%H"))
-        print(idx, date)
-        dates_list.append(date)
-        xfluxes[idx, :, :] = xpost_fluxes[idx*m:(idx+1)*m, 0].reshape(config.lats.shape[0], config.lons.shape[0], order="F")
-    
-    xpost = xpost.toarray()
-    xp_comb = xp_comb.toarray()
-    xpost_bkg = xpost_bkg.toarray()
-    
-    # Evaluation
-    Y_test = np.array([val["methane_mixing_ratio_bias_corrected"] for val in test_obs_dict.values()]).reshape(-1, 1)
-    H_b_test_sparse = csc_matrix(H_b_test)
-    H_test_comb = sparse.hstack((H_old_test, H_b_test_sparse), format='csc')
-    
-    ye_pred_train = H_old_train @ xpost_fluxes
-    ye_prior_train = H_old_train @ xp
-    ye_pred_test = H_old_test @ xpost_fluxes
-    ye_prior_test = H_old_test @ xp
-    
-    ysim_pred_train = H_train_comb @ xpost
-    ysim_prior_train = H_train_comb @ xp_comb
-    ysim_pred_test = H_test_comb @ xpost
-    ysim_prior_test = H_test_comb @ xp_comb
-    
-    ybkg_prior_train = H_b_train @ xp_bkg
-    ybkg_pred_train = H_b_train @ xpost_bkg
-    ybkg_prior_test = H_b_test @ xp_bkg
-    ybkg_pred_test = H_b_test @ xpost_bkg
-    
-    bkg_prior = xp_bkg.reshape((8, len(xp_bkg_date_range)), order="F")
-    xpost_bkg_store = xpost_bkg.reshape((8, len(xp_bkg_date_range)), order="F")
-    bkg_post = xpost_bkg_store
-    
-    
-    # Saving results
-    print("Storing data")
+        logger.info(f"Loading config from: {parsed_args.config}")
+        with open(parsed_args.config, "r") as f:
+            cfg = yaml.safe_load(f)
 
-    out_nc = nc.Dataset(file, "w", format="NETCDF4")
-    out_nc.createDimension("train_nobs", Y.shape[0])
-    out_nc.createDimension("test_nobs", Y_test.shape[0])
-    out_nc.createDimension("lon", config.lons.shape[0])
-    out_nc.createDimension("lat", config.lats.shape[0])
-    out_nc.createDimension("time", dates.shape[0])
-    out_nc.createDimension("bkg_octants", 8)
-    out_nc.createDimension("bkg_dates", len(xp_bkg_date_range))
+        # Load train/test data to auto-detect inversion period
+        logger.info(f"Loading train/test data to auto-detect inversion period...")
+        train_df_full = pd.read_csv(cfg["tropomi_train_file"])
+        test_df_full = pd.read_csv(cfg["tropomi_test_file"])
+
+        # Parse time column
+        train_df_full['time'] = pd.to_datetime(train_df_full['time'])
+        test_df_full['time'] = pd.to_datetime(test_df_full['time'])
+
+        # Auto-detect inversion period from TRAIN data only (test data is for evaluation only)
+        start_time_str = train_df_full['time'].min().strftime("%Y%m%d%H")
+        end_time_str = train_df_full['time'].max().strftime("%Y%m%d%H")
+
+        print(f"\n=== AUTO-DETECTION ===")
+        print(f"Train data range: {train_df_full['time'].min()} to {train_df_full['time'].max()}")
+        print(f"Auto-detected start_time: {start_time_str}")
+        print(f"Auto-detected end_time: {end_time_str}")
+
+        cfg["start_time"] = start_time_str
+        cfg["end_time"] = end_time_str
+
+        logger.info(f"✓ Auto-detected inversion period from train data: {start_time_str} to {end_time_str}")
+
+        config = TROPOMI_config(cfg)
+        logger.info(f"✓ Config loaded")
+        logger.info(f"Inversion period: {start_time_str} to {end_time_str}")
+
+        print(f"\n=== INVERSION PERIOD WITH BUFFER ===")
+        print(f"start_time (before buffer): {config.start_time}")
+        print(f"end_time (before buffer): {config.end_time}")
+        print(f"ems_buffer_days: {config.ems_buffer_days}")
+        print(f"inv_start_time (after buffer): {config.inv_start_time}")
+        print(f"inv_end_time (after buffer): {config.inv_end_time}")
+
+        file = os.path.join(config.output_path.rstrip('/'), f"inversion_data_{config.inv_start_time.strftime('%Y%m%d%H')}_{config.inv_end_time.strftime('%Y%m%d%H')}.nc")
+        if os.path.exists(file):
+            print(f"{file} already exists. Terminating ...")
+        else:
+            pprint(cfg)
+            # Use pre-loaded data (already filtered by Step 1)
+            train_df = train_df_full.copy()
+            test_df = test_df_full.copy()
+
+            # Parse bkg_ref column from string to list
+            if "bkg_ref" in train_df.columns:
+                train_df["bkg_ref"] = train_df["bkg_ref"].apply(lambda x: eval(x, {"datetime": datetime}) if isinstance(x, str) else x)
+            if "bkg_ref" in test_df.columns:
+                test_df["bkg_ref"] = test_df["bkg_ref"].apply(lambda x: eval(x, {"datetime": datetime}) if isinstance(x, str) else x)
+
+            print("Train size:", train_df.shape, "Test size:", test_df.shape)
+
+            train_obs_dict = get_obs_dict(train_df)
+            test_obs_dict = get_obs_dict(test_df)
     
-    out_nc.createVariable("lat", "f8", ("lat"))[:] = config.lats
-    out_nc.createVariable("lon", "f8", ("lon"))[:] = config.lons
-    out_nc.createVariable("date", "f8", ("time"))[:] = dates_list
-    out_nc.createVariable("bkg_dates", "f8", ("bkg_dates"))[:] = [int(val.strftime("%Y%m%d%H")) for val in xp_bkg_date_range]
+            bkg_dict, bkg_date_range = load_background_data(config)
+            # Use the background_date_range from Step 1, not recalculated range
+            # Convert to list so .index() method works
+            xp_bkg_date_range = list(bkg_date_range)
     
-    out_nc.createVariable("y_actual_train", "f8", ("train_nobs"))[:] = Y.toarray()
-    out_nc.createVariable("y_actual_test", "f8", ("test_nobs"))[:] = Y_test
+            dates = pd.date_range(start=config.inv_start_time, end=config.inv_end_time, freq="W")
+            print(f"\n=== DEBUG: Weekly dates ===")
+            print(f"inv_start_time: {config.inv_start_time}")
+            print(f"inv_end_time: {config.inv_end_time}")
+            print(f"dates created: {list(dates)}")
+            print(f"Train date range: {train_df_full['time'].min()} to {train_df_full['time'].max()}")
+
+            lons = config.lons
+            lats = config.lats
+            m = lons.shape[0]*lats.shape[0]
+            inventory_type = config.inventory_type
+            inventory_path = config.inventory_path
+            print(f"inventory type: {inventory_type} | inventory path: {inventory_path}")
+            emission = getEmissions(lons, lats, inventory_type, m, inventory_path=inventory_path, ems_scaling_factor=config.ems_scaling_factor)
+            print(dates, dates.shape)
+            xp = emission.compute_x_prior_vector(dates)
+            print("Prior flux shape:", xp.shape)
     
-    out_nc.createVariable("bkg_prior", "f8", ("bkg_octants", "bkg_dates"))[:, :] = bkg_prior
-    out_nc.createVariable("bkg_post", "f8", ("bkg_octants", "bkg_dates"))[:, :] = bkg_post
+            # Background prior
+            xp_bkg, xp_bkg_error = get_bkg_prior_error() 
     
-    out_nc.createVariable("ye_pred_train", "f8", ("train_nobs"))[:] = ye_pred_train
-    out_nc.createVariable("ye_prior_train", "f8", ("train_nobs"))[:] = ye_prior_train
-    out_nc.createVariable("ye_pred_test", "f8", ("test_nobs"))[:] = ye_pred_test
-    out_nc.createVariable("ye_prior_test", "f8", ("test_nobs"))[:] = ye_prior_test
+            # Jacobian flux
+            H_old_train = fill_H(config, dates, train_obs_dict)
+            H_old_test = fill_H(config, dates, test_obs_dict)
+            # print(H_old_train)
+            print("Jacobian flux train shape:", H_old_train.shape)
+            print("Jacobian flux test shape:", H_old_test.shape)
+            # import pdb; pdb.set_trace()
+            # Jacobian background
+            H_b_train = compute_H_background(train_obs_dict, config, xp_bkg_date_range)
+            H_b_test = compute_H_background(test_obs_dict, config, xp_bkg_date_range)
+            print(H_b_train)
+            print(H_b_test)
+            print("Jacobian background train shape:", H_b_train.shape)
+            print("Jacobian background test shape:", H_b_test.shape)
     
-    out_nc.createVariable("ysim_pred_train", "f8", ("train_nobs"))[:] = ysim_pred_train
-    out_nc.createVariable("ysim_prior_train", "f8", ("train_nobs"))[:] = ysim_prior_train
-    out_nc.createVariable("ysim_pred_test", "f8", ("test_nobs"))[:] = ysim_pred_test
-    out_nc.createVariable("ysim_prior_test", "f8", ("test_nobs"))[:] = ysim_prior_test
+            # Observation error correlation matrix
+            print("Computing obs error correlation matrix (R)")
+            R = fill_R(train_obs_dict)
+            # print(R)
+    
+            # Computing D and E
+            print("Computing D and E")
+            tau_week = 52
+            tau_year = 5
+            Sa_t_mod = get_Sa_t(xp, tau_week, tau_year, correlation_type="mod")
+            Sa_xy = load_npz("data/Sa_xy.npz")
+    
+            ems_uncert = config.ems_uncert
+            D, E = compute_D_E(Sa_xy, Sa_t_mod, emission, ems_uncert)
+    
+            # Computing background prior error covariance matrix
+            print("Computing background prior error covariance matrix (B_b)")
+            def compute_bkg_prior_error_covariance(xp_bkg, xp_bkg_date_range, xp_bkg_error, tau_day_bkg=1, lower_bound=1e-5):
+                B_b = np.zeros((xp_bkg.shape[0], xp_bkg.shape[0]))
+                for i in range(B_b.shape[0]):
+                    t_index_i = i // 8
+                    octant_index_i = i - t_index_i*8
+                    # print(t_index_i, octant_index_i, i)
+                    sigmai = xp_bkg_error[octant_index_i, t_index_i]
+                    B_b[i, i] = sigmai**2
+                    tstampi = xp_bkg_date_range[t_index_i]
+                    for j in range(i+1, B_b.shape[0]):
+                        t_index_j = j // 8
+                        octant_index_j = j - t_index_j*8
+                        tstampj = xp_bkg_date_range[t_index_j]
+                        sigmaj = xp_bkg_error[octant_index_j, t_index_j]
+                        if octant_index_i == octant_index_j:
+                            time_delay = (tstampj - tstampi).days
+                            temp_time = np.exp(-time_delay/tau_day_bkg)
+                            sig_val = sigmai*sigmaj*temp_time
+                            if sig_val >= lower_bound:
+                                B_b[i, j] = sig_val
+                                B_b[j, i] = sig_val
+                return B_b
+            B_b = compute_bkg_prior_error_covariance(xp_bkg, xp_bkg_date_range, xp_bkg_error, tau_day_bkg=1, lower_bound=1e-5)
+            print(B_b)
     
     
-    out_nc.createVariable("ybkg_pred_train", "f8", ("train_nobs"))[:] = ybkg_pred_train
-    out_nc.createVariable("ybkg_prior_train", "f8", ("train_nobs"))[:] = ybkg_prior_train
-    out_nc.createVariable("ybkg_pred_test", "f8", ("test_nobs"))[:] = ybkg_pred_test
-    out_nc.createVariable("ybkg_prior_test", "f8", ("test_nobs"))[:] = ybkg_prior_test
+            # Inversion data prep
+            Y = np.array([val["ch4"] for val in train_obs_dict.values()]).reshape(-1, 1)
+            xp_comb = np.concat([xp, xp_bkg], axis=0)
+            Y = csc_matrix(Y)
+            xp_comb = csc_matrix(xp_comb)
+    
+            H_b_train_sparse = csc_matrix(H_b_train)
+            H_train_comb = sparse.hstack((H_old_train, H_b_train_sparse), format='csc')
+    
+            # Obs error correlation to covariance
+            y_sim = H_train_comb @ xp_comb
+            mismatch = Y - y_sim
+            sigma_mismatch = np.std(mismatch.toarray())
+
+            # DIAGNOSTIC: H matrix and prediction statistics
+            print("\n" + "="*70)
+            print("DIAGNOSTIC: H MATRIX AND PRIOR PREDICTIONS")
+            print("="*70)
+            print(f"\nH_old (emissions) matrix statistics:")
+            print(f"  Shape: {H_old_train.shape}")
+            print(f"  Non-zero elements: {H_old_train.nnz}")
+            print(f"  Sparsity: {1 - H_old_train.nnz / (H_old_train.shape[0] * H_old_train.shape[1]):.4f}")
+            if H_old_train.nnz > 0:
+                print(f"  Min value: {H_old_train.data.min():.2e}")
+                print(f"  Max value: {H_old_train.data.max():.2e}")
+                print(f"  Mean value: {H_old_train.data.mean():.2e}")
+
+            print(f"\nH_b (background) matrix statistics:")
+            print(f"  Shape: {H_b_train.shape}")
+            H_b_array = H_b_train.toarray() if hasattr(H_b_train, 'toarray') else H_b_train
+            print(f"  Min value: {H_b_array.min():.2e}")
+            print(f"  Max value: {H_b_array.max():.2e}")
+            print(f"  Mean value: {H_b_array.mean():.2e}")
+
+            # Prior predictions
+            y_sim_array = y_sim.toarray().flatten() if hasattr(y_sim, 'toarray') else y_sim.flatten()
+            y_em_temp = H_old_train @ xp
+            y_emissions = y_em_temp.toarray().flatten() if hasattr(y_em_temp, 'toarray') else y_em_temp.flatten()
+            y_bk_temp = H_b_train @ xp_bkg
+            y_background = y_bk_temp.toarray().flatten() if hasattr(y_bk_temp, 'toarray') else y_bk_temp.flatten()
+            y_actual = Y.toarray().flatten() if hasattr(Y, 'toarray') else Y.flatten()
+
+            print(f"\nPRIOR PREDICTIONS (using prior x_prior and x_bkg_prior):")
+            print(f"  Emissions contribution:")
+            print(f"    Min: {y_emissions.min():.2f} ppb")
+            print(f"    Mean: {y_emissions.mean():.2f} ppb")
+            print(f"    Max: {y_emissions.max():.2f} ppb")
+            print(f"  Background contribution:")
+            print(f"    Min: {y_background.min():.2f} ppb")
+            print(f"    Mean: {y_background.mean():.2f} ppb")
+            print(f"    Max: {y_background.max():.2f} ppb")
+            print(f"  Total predicted (emissions + background):")
+            print(f"    Min: {y_sim_array.min():.2f} ppb")
+            print(f"    Mean: {y_sim_array.mean():.2f} ppb")
+            print(f"    Max: {y_sim_array.max():.2f} ppb")
+            print(f"  Actual observations:")
+            print(f"    Min: {y_actual.min():.2f} ppb")
+            print(f"    Mean: {y_actual.mean():.2f} ppb")
+            print(f"    Max: {y_actual.max():.2f} ppb")
+            print(f"  Prior residual RMSE: {np.sqrt(np.mean((y_actual - y_sim_array)**2)):.2f} ppb")
+            print("="*70 + "\n")
+
+            Ro = R*(sigma_mismatch**2)
+    
+            # HB and HBHT matrices
+            print("Computing HB and HBHT matrices")
+            HB_old = HQ_sparse_parallel(H_old_train, D, E, n_jobs=4)
+            HBHT_old = HQHT_sparse(HB_old, H_old_train, D, E)
+    
+            HB_b = H_b_train @ B_b
+            HB_b = csc_matrix(HB_b)
+    
+            HBHT_b = HB_b @ H_b_train.T
+            HBHT_b = csc_matrix(HBHT_b)
+    
+            HB_comb = sparse.hstack((HB_old, HB_b), format='csc')
+            HBHT_comb = HBHT_old + HBHT_b
+    
+            # Conducting analytical inversion
+            print("Inversion")
+            mismatch = csc_matrix(mismatch)
+            xp_comb = csc_matrix(xp_comb)
+    
+            inv_term = inv(HBHT_comb + Ro)
+            gain1 = inv_term @ mismatch
+            xdiff = HB_comb.T @ (gain1)
+            xpost = xp_comb + xdiff
+
+            xpost_fluxes = xpost[:xp.shape[0]]
+            xpost_bkg = xpost[xp.shape[0]:]
+
+            # DIAGNOSTIC: Posterior predictions
+            print("\n" + "="*70)
+            print("DIAGNOSTIC: POSTERIOR PREDICTIONS (after inversion)")
+            print("="*70)
+            xpost_array = xpost.toarray() if hasattr(xpost, 'toarray') else xpost
+            xp_array = xp_comb.toarray() if hasattr(xp_comb, 'toarray') else xp_comb
+
+            y_post_em = H_old_train @ xpost_fluxes
+            y_post_emissions = y_post_em.toarray().flatten() if hasattr(y_post_em, 'toarray') else y_post_em.flatten()
+            y_post_bk = H_b_train @ xpost_bkg
+            y_post_background = y_post_bk.toarray().flatten() if hasattr(y_post_bk, 'toarray') else y_post_bk.flatten()
+            y_post_total = y_post_emissions + y_post_background
+
+            print(f"\nPOSTERIOR PREDICTIONS (using fitted x_post):")
+            print(f"  Emissions contribution:")
+            print(f"    Min: {y_post_emissions.min():.2f} ppb")
+            print(f"    Mean: {y_post_emissions.mean():.2f} ppb")
+            print(f"    Max: {y_post_emissions.max():.2f} ppb")
+            print(f"  Background contribution:")
+            print(f"    Min: {y_post_background.min():.2f} ppb")
+            print(f"    Mean: {y_post_background.mean():.2f} ppb")
+            print(f"    Max: {y_post_background.max():.2f} ppb")
+            print(f"  Total predicted (emissions + background):")
+            print(f"    Min: {y_post_total.min():.2f} ppb")
+            print(f"    Mean: {y_post_total.mean():.2f} ppb")
+            print(f"    Max: {y_post_total.max():.2f} ppb")
+            print(f"  Posterior residual RMSE: {np.sqrt(np.mean((y_actual - y_post_total)**2)):.2f} ppb")
+
+            print(f"\nCHANGES FROM PRIOR TO POSTERIOR:")
+            xdiff_flux_temp = xpost_fluxes - xp
+            xdiff_fluxes = xdiff_flux_temp.toarray() if hasattr(xdiff_flux_temp, 'toarray') else xdiff_flux_temp
+            xdiff_bk_temp = xpost_bkg - xp_bkg
+            xdiff_bkg = xdiff_bk_temp.toarray() if hasattr(xdiff_bk_temp, 'toarray') else xdiff_bk_temp
+            print(f"  Emissions flux change (mean): {xdiff_fluxes.mean():.4f} umol/m2/s")
+            print(f"  Background conc change (mean): {xdiff_bkg.mean():.4f} ppb")
+            print(f"  Emissions flux change (max): {np.abs(xdiff_fluxes).max():.4f} umol/m2/s")
+            print(f"  Background conc change (max): {np.abs(xdiff_bkg).max():.4f} ppb")
+            print("="*70 + "\n")
+
+            print("Gathering fluxes")
+            xfluxes = np.zeros((dates.shape[0], config.lats.shape[0], config.lons.shape[0]))
+            xpost_fluxes = xpost_fluxes.toarray()
+            dates_list = []
+            for idx, date in enumerate(dates):
+                date = int(date.strftime("%Y%m%d%H"))
+                print(idx, date)
+                dates_list.append(date)
+                xfluxes[idx, :, :] = xpost_fluxes[idx*m:(idx+1)*m, 0].reshape(config.lats.shape[0], config.lons.shape[0], order="F")
+    
+            xpost = xpost.toarray()
+            xp_comb = xp_comb.toarray()
+            xpost_bkg = xpost_bkg.toarray()
+    
+            # Evaluation
+            Y_test = np.array([val["ch4"] for val in test_obs_dict.values()]).reshape(-1, 1)
+            H_b_test_sparse = csc_matrix(H_b_test)
+            H_test_comb = sparse.hstack((H_old_test, H_b_test_sparse), format='csc')
+    
+            ye_pred_train = H_old_train @ xpost_fluxes
+            ye_prior_train = H_old_train @ xp
+            ye_pred_test = H_old_test @ xpost_fluxes
+            ye_prior_test = H_old_test @ xp
+    
+            ysim_pred_train = H_train_comb @ xpost
+            ysim_prior_train = H_train_comb @ xp_comb
+            ysim_pred_test = H_test_comb @ xpost
+            ysim_prior_test = H_test_comb @ xp_comb
+    
+            ybkg_prior_train = H_b_train @ xp_bkg
+            ybkg_pred_train = H_b_train @ xpost_bkg
+            ybkg_prior_test = H_b_test @ xp_bkg
+            ybkg_pred_test = H_b_test @ xpost_bkg
+    
+            bkg_prior = xp_bkg.reshape((8, len(xp_bkg_date_range)), order="F")
+            xpost_bkg_store = xpost_bkg.reshape((8, len(xp_bkg_date_range)), order="F")
+            bkg_post = xpost_bkg_store
     
     
-    out_nc.createVariable("post_fluxes", "f8", ("time", "lat", "lon"))[:, :, :] = xfluxes 
-    out_nc.createVariable("prior_fluxes", "f8", ("lat", "lon"))[:, :] = emission.emissions
-    out_nc.close()
+            # Saving results
+            print("Storing data")
+
+            out_nc = nc.Dataset(file, "w", format="NETCDF4")
+            out_nc.createDimension("train_nobs", Y.shape[0])
+            out_nc.createDimension("test_nobs", Y_test.shape[0])
+            out_nc.createDimension("lon", config.lons.shape[0])
+            out_nc.createDimension("lat", config.lats.shape[0])
+            out_nc.createDimension("time", dates.shape[0])
+            out_nc.createDimension("bkg_octants", 8)
+            out_nc.createDimension("bkg_dates", len(xp_bkg_date_range))
+    
+            out_nc.createVariable("lat", "f8", ("lat"))[:] = config.lats
+            out_nc.createVariable("lon", "f8", ("lon"))[:] = config.lons
+            out_nc.createVariable("date", "f8", ("time"))[:] = dates_list
+            out_nc.createVariable("bkg_dates", "f8", ("bkg_dates"))[:] = [int(val.strftime("%Y%m%d%H")) for val in xp_bkg_date_range]
+    
+            out_nc.createVariable("y_actual_train", "f8", ("train_nobs"))[:] = Y.toarray()
+            out_nc.createVariable("y_actual_test", "f8", ("test_nobs"))[:] = Y_test
+    
+            out_nc.createVariable("bkg_prior", "f8", ("bkg_octants", "bkg_dates"))[:, :] = bkg_prior
+            out_nc.createVariable("bkg_post", "f8", ("bkg_octants", "bkg_dates"))[:, :] = bkg_post
+    
+            out_nc.createVariable("ye_pred_train", "f8", ("train_nobs"))[:] = ye_pred_train
+            out_nc.createVariable("ye_prior_train", "f8", ("train_nobs"))[:] = ye_prior_train
+            out_nc.createVariable("ye_pred_test", "f8", ("test_nobs"))[:] = ye_pred_test
+            out_nc.createVariable("ye_prior_test", "f8", ("test_nobs"))[:] = ye_prior_test
+    
+            out_nc.createVariable("ysim_pred_train", "f8", ("train_nobs"))[:] = ysim_pred_train
+            out_nc.createVariable("ysim_prior_train", "f8", ("train_nobs"))[:] = ysim_prior_train
+            out_nc.createVariable("ysim_pred_test", "f8", ("test_nobs"))[:] = ysim_pred_test
+            out_nc.createVariable("ysim_prior_test", "f8", ("test_nobs"))[:] = ysim_prior_test
+    
+    
+            out_nc.createVariable("ybkg_pred_train", "f8", ("train_nobs"))[:] = ybkg_pred_train
+            out_nc.createVariable("ybkg_prior_train", "f8", ("train_nobs"))[:] = ybkg_prior_train
+            out_nc.createVariable("ybkg_pred_test", "f8", ("test_nobs"))[:] = ybkg_pred_test
+            out_nc.createVariable("ybkg_prior_test", "f8", ("test_nobs"))[:] = ybkg_prior_test
+    
+    
+            out_nc.createVariable("post_fluxes", "f8", ("time", "lat", "lon"))[:, :, :] = xfluxes
+            out_nc.createVariable("prior_fluxes", "f8", ("lat", "lon"))[:, :] = emission.emissions
+            out_nc.close()
+
+            logger.info("="*60)
+            logger.info("✓ INVERSION COMPLETED SUCCESSFULLY")
+            logger.info("="*60)
+            logger.info(f"Results saved to: {file}")
+
+    except Exception as e:
+        logger.error("="*60)
+        logger.error(f"ERROR: {str(e)}", exc_info=True)
+        logger.error("="*60)
+        raise

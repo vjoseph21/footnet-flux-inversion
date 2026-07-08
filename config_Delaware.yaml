@@ -1,15 +1,14 @@
-tropomi_filepath: PATH
+tropomi_filepath: data/processed/tropomi_obs_2025.csv
 
 clon: -103.8
 clat: 32.3
 xres: 0.0083333
 yres: 0.0083333
 
-tropomi_processed_file: PATH
-tropomi_train_file: PATH
-tropomi_test_file: PATH
-lat_lon_file: PATH
-tropomi_bkg_file: PATH
+tropomi_train_file:  data/processed/tropomi_obs_2025_06_train.csv
+tropomi_test_file: data/processed/tropomi_obs_2025_06_test.csv
+lat_lon_file: data/processed/lat_lon.npz
+tropomi_bkg_file: data/processed/background.pkl
 
 ems_buffer_days: 7
 upwind_degree_margin: 1
@@ -18,17 +17,17 @@ buffer_months: 6
 obs_indices_margin: 100
 met_temp_resolution_background: 6 # hours wind data for computing background 
 
-HRRR_DIR: PATH
-HRRR_LAT_LON_MAPPING: PATH
+HRRR_DIR: data/raw/hrrr/lite
+HRRR_LAT_LON_MAPPING: data/processed/hrrr_latlons.npz
 trimsize: 150
 
-model_path: PATH
-footprint_path: PATH
+model_path: data/models/ColumnFootNet_in_sample.pth
+footprint_path: data/footprints
 maximum_domain_trajectory: 424.264
 
 inventory_type: "EPA"
-inventory_path: PATH
+inventory_path: data/emissions/epa_ch4_emissions_delaware_2025_mismatched.nc
 ems_scaling_factor: 4
 ems_uncert: 0.5
 
-output_path: PATH
+output_path: data/inversions/

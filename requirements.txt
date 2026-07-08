@@ -1,0 +1,27 @@
+# Core scientific computing
+numpy
+pandas
+scipy
+scikit-learn
+
+# Data I/O
+netCDF4
+xarray
+pygrib
+
+# Geospatial
+geopandas
+shapely
+cartopy
+
+# Machine Learning
+torch
+
+# Meteorological data
+herbie-data
+
+# Utilities
+pyyaml
+tqdm
+joblib
+matplotlib

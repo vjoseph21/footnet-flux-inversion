@@ -4,7 +4,6 @@ clat: 31.491669
 xres: 0.0083333
 yres: 0.0083333
 
-tropomi_processed_file: PATH
 tropomi_train_file: PATH
 tropomi_test_file: PATH
 lat_lon_file: PATH

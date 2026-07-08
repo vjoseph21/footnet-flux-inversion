@@ -7,6 +7,7 @@ import pandas as pd
 from shapely import Polygon, Point
 from math import sin, cos, asin, atan2, radians, degrees
 from joblib import Parallel, delayed
+import os
 
 def interp_weights(grid_x_in, grid_y_in, grid_x_out, grid_y_out, d=2):
     xy=np.zeros([grid_x_in.shape[0]*grid_x_in.shape[1],2])
@@ -38,7 +39,7 @@ def get_hrrr_file(yy, mm, dd, hh, HRRR_DIR):
     # 0, 6, 12, 18
     hhh = [0, 6, 12, 18]
     hidx = int(hh//6)
-    return HRRR_DIR + '%04d/hysplit.%04d%02d%02d.%02dz.nc'%(yy, yy, mm, dd, hhh[hidx])
+    return HRRR_DIR + '/%04d/hysplit.%04d%02d%02d.%02dz.nc'%(yy, yy, mm, dd, hhh[hidx])
     # return HRRR_DIR + 'hysplit.%04d%02d%02d.%02dz.hrrra'%(yy, mm, dd, hhh[hidx])
 
 
@@ -52,7 +53,10 @@ def get_winds(footlons, footlats, timestamp, HRRR_DIR, trimsize, hr3lat_full, hr
     histdt = dtnow + datetime.timedelta(hours=hist)
     _yy, _mm, _dd, _hh = histdt.year, histdt. month, histdt.day, histdt.hour
     h3rfile = get_hrrr_file(_yy, _mm, _dd, _hh, HRRR_DIR)
-    
+
+    if not os.path.exists(h3rfile):
+        raise FileNotFoundError(f"HRRR file not found: {h3rfile}")
+
     fh = nc.Dataset(h3rfile)
     # fh = xr.open_dataset(h3rfile, engine='pseudonetcdf')
     # fh = fh_dict[histdt]
@@ -91,7 +95,9 @@ def get_winds(footlons, footlats, timestamp, HRRR_DIR, trimsize, hr3lat_full, hr
 
 class Background():
     def __init__(self, dk, domain_gdf, octant_dict, background_date_range, config):
-        self.timestamp_list = list(set(dk['time']))
+        # Use background_date_range to ensure we only fetch meteorology for intended dates
+        # Don't use observation times, which would extend backward 18 days unnecessarily
+        self.timestamp_list = [pd.Timestamp(date).to_pydatetime() for date in background_date_range]
         self.met_dict = {}
         self.HRRR_DIR = config.HRRR_DIR
         self.trimsize = config.trimsize
@@ -112,7 +118,7 @@ class Background():
             self.background_dict[octant]['count'] = []
             self.background_dict[octant]["boundary"] = octant_dict[octant]
             for jdx, date in enumerate(self.background_date_range):
-                concs = list(domain_gdf[(domain_gdf['reference_time']==datetime.datetime.strftime(date, "%Y-%m-%d")) & (domain_gdf.geometry.within(octant_dict[octant]))]['methane_mixing_ratio_bias_corrected'])
+                concs = list(domain_gdf[(domain_gdf['time'].dt.date==date.date()) & (domain_gdf.geometry.within(octant_dict[octant]))]['ch4'])
                 
                 self.background_dict[octant]['count'].append(len(concs))
                 if concs:
@@ -139,10 +145,19 @@ class Background():
     
     def get_met_data(self, timestamp):
         met_dict = {}
+        # Look backward 72 timesteps (18 days) for meteorological history
+        # BUT constrain to stay within background_date_range to only use available HRRR data
         met_timestamps = [timestamp + datetime.timedelta(hours=-i*self.met_temp_resolution) for i in range(0, 72)]
+        # Filter to only timestamps within background_date_range
+        min_date = self.background_date_range[0]
+        met_timestamps = [t for t in met_timestamps if t >= min_date]
         for met_timestamp in met_timestamps:
             if met_timestamp not in met_dict:
-                met_dict[met_timestamp] = get_winds(self.lons, self.lats, datetime.datetime.strftime(met_timestamp, "%Y%m%d%H"), self.HRRR_DIR, self.trimsize, self.hr3lat_full, self.hr3lon_full)
+                try:
+                    met_dict[met_timestamp] = get_winds(self.lons, self.lats, datetime.datetime.strftime(met_timestamp, "%Y%m%d%H"), self.HRRR_DIR, self.trimsize, self.hr3lat_full, self.hr3lon_full)
+                except FileNotFoundError:
+                    # Skip missing HRRR files; continue with available data
+                    pass
         return met_dict
 
     def get_point_at_distance(self, lat1, lon1, d, bearing, R=6371):
@@ -208,7 +223,9 @@ class Background():
         met_timestamps = [tstamp + datetime.timedelta(hours=-i*self.met_temp_resolution) for i in reversed(range(1, 72))]
         u_list, v_list = [], []
         for met_timestamp in met_timestamps:
-            met_data = self.met_dict.get(met_timestamp, None)
+            # Round to nearest HRRR time (00:00, 06:00, 12:00, 18:00)
+            hrrr_timestamp = met_timestamp.replace(hour=(met_timestamp.hour//6)*6, minute=0, second=0, microsecond=0)
+            met_data = self.met_dict.get(hrrr_timestamp, None)
             if met_data is not None:
                 u, v = np.average(met_data[:, :, 0]), np.average(met_data[:, :, 1])
                 # Reversed winds
@@ -217,6 +234,11 @@ class Background():
 
         trajectory = self.get_trajectory_until_exit(u_list, v_list, self.lats, self.lons, rlon, rlat, dt_hours=self.met_temp_resolution)
         exit_time = trajectory["exit_time"] # hours after release that particles left the domain
+
+        # If no wind data available, return defaults
+        if exit_time is None:
+            return None, None, trajectory
+
         exit_time = tstamp - datetime.timedelta(hours=exit_time)
         exit_indices = (trajectory["exit_lat_idx"], trajectory["exit_lon_idx"])
         bkg, bkg_error, norm_dist, ref_list = self.get_weighted_background(trajectory["exit_lat"], trajectory["exit_lon"], exit_time)
@@ -243,7 +265,23 @@ class Background():
         dt = dt_hours * 3600  # seconds
     
         winds = list(zip(uxy_list, vxy_list))
-    
+
+        # If no wind data available (missing HRRR files), return early with defaults
+        if not winds:
+            return {
+                "trajectory_lats": traj_lats,
+                "trajectory_lons": traj_lons,
+                "exit_lat": None,
+                "exit_lon": None,
+                "exit_lat_idx": 0,
+                "exit_lon_idx": 0,
+                "exit_step": None,
+                "exit_time": None,
+                "winds": ([], []),
+                "norm_dist": 0,
+                "ref_list": [],
+            }
+
         step_idx = 0
         while True:
             # pick wind for this step

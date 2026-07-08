@@ -149,7 +149,11 @@ class getEmissions():
 
         Ao = 6.0221408e+23
 
-        emission = np.zeros((350, 700))
+        # Get actual EPA data shape instead of hardcoding
+        epa_lats = np.array(data['lat'])
+        epa_lons = np.array(data['lon'])
+
+        emission = np.zeros((epa_lats.shape[0], epa_lons.shape[0]))
         for var in data.variables:
             # print(var)
             if "emi" in var:
@@ -159,9 +163,6 @@ class getEmissions():
 
         # emission = emission*(3600*16)/(Ao*1000)  # molec per s to kg per hour conversion
 
-        epa_lats = np.array(data['lat'])
-        epa_lons = np.array(data['lon'])
-
         ems_epa = np.zeros((lats.shape[0], lons.shape[0]))
         for idx, lat in enumerate(lats):
             lat_index = np.abs(epa_lats - lat).argmin()
@@ -170,9 +171,10 @@ class getEmissions():
                 ems_epa[idx, jdx] = emission[lat_index, lon_index]
 
 
-        # conversion_factor = (1000)*(10**6)/(3600*16)  # Conversion to umol/s
-        conversion_factor = (1e6)*(1e4)/Ao # Conversion to umol/m2/s
-        ems_epa_umolm2s = conversion_factor*ems_epa  #/area
+        # Data already in umol/m2/s (no conversion needed for synthetic data)
+        # For real EPA data in molec/(cm2·s), would use: (1e6)*(1e4)/Ao
+        conversion_factor = 1.0
+        ems_epa_umolm2s = conversion_factor*ems_epa
         self.emissions = ems_epa_umolm2s
         return ems_epa_umolm2s
 

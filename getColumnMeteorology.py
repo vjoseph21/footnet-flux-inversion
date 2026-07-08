@@ -56,8 +56,13 @@ class ColumnMeteorology():
             tstamp_list = [datetime.datetime.strftime(val, "%Y%m%d%H") for val in tstamp_list]
             for dt in tstamp_list:
                 if dt not in input_met_dict:
-                    input_met_dict[dt] = self.get_met_column_data_lite(lons, lats, dt, hist=hist, trimsize=trimsize)
-                    processed_input_dict[dt] = self.transform_func_24h(input_met_dict[dt].copy())
+                    met_data = self.get_met_column_data_lite(lons, lats, dt, hist=hist, trimsize=trimsize)
+                    if met_data is not None:
+                        input_met_dict[dt] = met_data
+                        processed_input_dict[dt] = self.transform_func_24h(input_met_dict[dt].copy())
+                    else:
+                        input_met_dict[dt] = None
+                        processed_input_dict[dt] = None
         return input_met_dict, processed_input_dict
 
     def transform_func_24h(self, _xx):
@@ -136,7 +141,7 @@ class ColumnMeteorology():
         # 0, 6, 12, 18
         hhh = [0, 6, 12, 18]
         hidx = int(hh//6)
-        return self.HRRR_DIR + '%04d/hysplit.%04d%02d%02d.%02dz.nc'%(yy, yy, mm, dd, hhh[hidx])
+        return self.HRRR_DIR + '/%04d/hysplit.%04d%02d%02d.%02dz.nc'%(yy, yy, mm, dd, hhh[hidx])
         # return HRRR_DIR + 'hysplit.%04d%02d%02d.%02dz.hrrra'%(yy, mm, dd, hhh[hidx]) # For direct loading data from original HRRR files
 
 
@@ -158,9 +163,17 @@ class ColumnMeteorology():
         clat = footlats[int(footlats.shape[0]/2)]
         dtnow = datetime.datetime.strptime(timestamp[:10], "%Y%m%d%H")
         histdt = dtnow + datetime.timedelta(hours=hist)
-        _yy, _mm, _dd, _hh = histdt.year, histdt. month, histdt.day, histdt.hour
+        _yy, _mm, _dd, _hh = histdt.year, histdt.month, histdt.day, histdt.hour
         h3rfile = self.get_hrrr_file(_yy, _mm, _dd, _hh)
-        fh = nc.Dataset(h3rfile)
+
+        # Handle missing HRRR files gracefully
+        try:
+            fh = nc.Dataset(h3rfile)
+        except FileNotFoundError:
+            print(f"⚠ WARNING: Missing HRRR file: {h3rfile}")
+            print(f"  Skipping meteorology for this time. Observation may be excluded from inversion.")
+            return None
+
         # fh = xr.open_dataset(h3rfile, engine="pseudonetcdf") # For direct loading data from original HRRR files (very slow)
         h3r_data = fh.variables
         times = [pd.to_datetime(int(val), unit='ns') for val in np.array(fh['time'])]
@@ -204,8 +217,8 @@ class ColumnMeteorology():
         
         _t850 = np.array(h3r_data['TEMP9_850hPa'][tidx, cxind-trimsize:cxind+trimsize, cyind-trimsize:cyind+trimsize])
         _t850r = self.regmet(_t850, vtx, wts, grid_x_out.shape)
-        
-        output = np.zeros((footlons.shape[0], footlats.shape[0], len(predlist)))
+
+        output = np.zeros((footlats.shape[0], footlons.shape[0], len(predlist)))
         output[:, :, 0] = _u10mr
         output[:, :, 1] = _v10mr
         output[:, :, 2] = _pblhr

@@ -1,0 +1,72 @@
+# Python virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+*.log.*
+step*.log
+
+# Data directories (input/output)
+data/
+raw/
+processed/
+models/
+inversions/
+footprints/
+emissions/
+
+# HRRR meteorological data
+hrrr/
+tropomi/
+
+# Output files
+*.png
+*.jpg
+*.pdf
+*.nc
+*.npz
+*.pkl
+*.pickle
+*.csv
+*.npy
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Configuration files with secrets
+.env
+.env.local
+config_*.yaml
